@@ -1,0 +1,102 @@
+name: Generate Wordlist
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Character set
+        type: choice
+        options: [digits, letters, alphanumeric, custom, combined]
+        default: alphanumeric
+      custom:
+        description: Custom characters (for custom or combined)
+        type: string
+        default: ''
+      min_length:
+        description: Minimum length (8-10)
+        default: '8'
+        required: true
+      max_length:
+        description: Maximum length (8-10)
+        default: '10'
+        required: true
+      limit:
+        description: Number of lines (1-1000000)
+        default: '100000'
+        required: true
+      start:
+        description: Starting offset (0 for first batch)
+        default: '0'
+        required: true
+permissions:
+  contents: read
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Generate bounded batch
+        env:
+          MODE: ${{ inputs.mode }}
+          CUSTOM: ${{ inputs.custom }}
+          MIN_LENGTH: ${{ inputs.min_length }}
+          MAX_LENGTH: ${{ inputs.max_length }}
+          LIMIT: ${{ inputs.limit }}
+          START: ${{ inputs.start }}
+        run: |
+          python - <<'PY'
+          import os
+          import string
+          from pathlib import Path
+          
+          mode = os.getenv("MODE", "alphanumeric")
+          custom = os.getenv("CUSTOM", "")
+          sets = {"digits": string.digits, "letters": string.ascii_letters,
+                  "alphanumeric": string.ascii_letters + string.digits,
+                  "custom": custom, "combined": string.ascii_letters + string.digits + custom}
+          charset = "".join(dict.fromkeys(sets[mode]))
+          minimum = int(os.getenv("MIN_LENGTH", "8"))
+          maximum = int(os.getenv("MAX_LENGTH", "10"))
+          limit = int(os.getenv("LIMIT", "100000"))
+          start = int(os.getenv("START", "0"))
+          if not charset or len(charset) > 256 or any(c.isspace() or not c.isprintable() for c in charset):
+              raise ValueError("Use 1–256 printable, non-whitespace characters")
+          if not 8 <= minimum <= maximum <= 10:
+              raise ValueError("Lengths must be between 8 and 10")
+          if not 1 <= limit <= 1_000_000 or start < 0:
+              raise ValueError("Limit must be 1–1000000; start must be nonnegative")
+          total = sum(len(charset) ** n for n in range(minimum, maximum + 1))
+          if start >= total:
+              raise ValueError("Start is outside the search space")
+          Path("output").mkdir(exist_ok=True)
+          written = 0
+          skip = start
+          with open("output/wordlist.txt", "w", encoding="utf-8", newline="\n") as out:
+              for length in range(minimum, maximum + 1):
+                  count = len(charset) ** length
+                  if skip >= count:
+                      skip -= count
+                      continue
+                  for index in range(skip, min(count, skip + limit - written)):
+                      chars = [charset[0]] * length
+                      for pos in range(length - 1, -1, -1):
+                          index, digit = divmod(index, len(charset))
+                          chars[pos] = charset[digit]
+                      out.write("".join(chars) + "\n")
+                      written += 1
+                  skip = 0
+                  if written == limit:
+                      break
+          summary = f"Total combinations: {total}\nWritten: {written}\nStart: {start}\nNext start: {start + written}\n"
+          Path("output/summary.txt").write_text(summary, encoding="utf-8")
+          print(summary)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wordlist-${{ github.run_id }}
+          path: output/
+          retention-days: 3
+
